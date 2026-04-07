@@ -6,7 +6,6 @@
 
 基于 SQLite 的自动化漏洞挖掘与资产监控数据存储/展示套件。此工具链将红蓝对抗中的各类信息搜集工具（如 Subfinder, OneForAll, httpx, arjun 等）整合流水线，直接驱动可视化审计面板。
 
-## 灵感来源 <https://bugbounty.info/>
 
 ## 目录结构
 
