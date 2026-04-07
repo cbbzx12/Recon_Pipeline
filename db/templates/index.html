@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>全维度侦察聚合面板</title>
+    <!-- Bootstrap CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background-color: #f8f9fa; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+        .card { border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); margin-bottom: 20px; }
+        .stat-card { text-align: center; padding: 20px; position: relative;}
+        .stat-number { font-size: 2rem; font-weight: bold; color: #0d6efd; }
+        .nav-tabs { margin-bottom: 20px; }
+        .new-badge { font-size: 0.75em; vertical-align: super; margin-left: 2px; }
+        .stat-new { position: absolute; top: 10px; right: 10px; font-size: 0.8em; }
+        .content-scroll { max-height: 500px; overflow-y: auto; overflow-x: hidden; }
+        .url-link { color: #212529; text-decoration: none; word-wrap: break-word; }
+        .url-link:hover { text-decoration: underline; color: #0d6efd; }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+        <div class="container-fluid">
+            <a class="navbar-brand" href="#">🛡️ 精简资产与监控聚合引擎面板</a>
+        </div>
+    </nav>
+
+    <div class="container-fluid mt-4">
+        <!-- Dashboard Stats -->
+        <div class="d-flex justify-content-between align-items-center mb-3">
+            <h4 class="mb-0">全维度资产雷达统计 (Dashboard)</h4>
+            <button class="btn btn-outline-success btn-sm btn-lg px-4" onclick="ackAll()">✔️ 全部资产标为已审计 (消除红圈高亮)</button>
+        </div>
+        
+        <div class="row" id="stats-container">
+            <!-- Stats loaded by JS -->
+        </div>
+
+        <ul class="nav nav-tabs mt-4" id="mainTabs">
+            <li class="nav-item">
+                <a class="nav-link active" data-bs-toggle="tab" href="#attack-chain">🔗 网络边界视图 (子域/IP/端口)</a>
+            </li>
+            <li class="nav-item">
+                <a class="nav-link" data-bs-toggle="tab" href="#content-js">📄 前端 JS 监听 (Katana)</a>
+            </li>
+            <li class="nav-item">
+                <a class="nav-link" data-bs-toggle="tab" href="#content-urls">🌐 隐蔽路径监控 (Wayback/Gau)</a>
+            </li>
+            <li class="nav-item">
+                <a class="nav-link" data-bs-toggle="tab" href="#content-certs">🔒 透明度证书流 (CertStream)</a>
+            </li>
+        </ul>
+
+        <div class="tab-content">
+            <!-- 边界视图 -->
+            <div class="tab-pane fade show active" id="attack-chain">
+                <div class="card p-3" style="overflow-x: auto;">
+                    <input type="text" id="searchInput" class="form-control mb-3 w-25" placeholder="搜索 域名 / IP / 端口...">
+                    <table class="table table-bordered table-hover text-nowrap">
+                        <thead class="table-light">
+                            <tr>
+                                <th>子域名 (Domain)</th>
+                                <th>解析 IP (Resolved IP)</th>
+                                <th>CDN 状态</th>
+                                <th>开放端口 (Open Ports)</th>
+                            </tr>
+                        </thead>
+                        <tbody id="chain-tb"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- JS 视图 -->
+            <div class="tab-pane fade" id="content-js">
+                <div class="card p-3 content-scroll">
+                    <table class="table table-striped table-hover">
+                        <tbody id="tb-js"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- URLs 视图 -->
+            <div class="tab-pane fade" id="content-urls">
+                <div class="card p-3 content-scroll">
+                    <table class="table table-striped table-hover">
+                        <tbody id="tb-urls"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Certs 视图 -->
+            <div class="tab-pane fade" id="content-certs">
+                <div class="card p-3 content-scroll">
+                    <table class="table table-striped table-hover">
+                        <thead class="table-light"><tr><th>新签发证书域名 (Domain)</th><th>报警状态</th></tr></thead>
+                        <tbody id="tb-certs"></tbody>
+                    </table>
+                </div>
+            </div>
+
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        // 加载实时统计指标
+        fetch('/api/stats').then(r=>r.json()).then(data => {
+            const c = document.getElementById('stats-container');
+            for(let key in data) {
+                if(data[key].count === undefined) continue;
+                let newTag = data[key].new_count > 0 
+                  ? `<span class="badge bg-danger stat-new">+${data[key].new_count} 未读</span>` 
+                  : '';
+                c.innerHTML += `
+                    <div class="col-md-3 col-lg-2">
+                        <div class="card stat-card shadow-sm border-0 bg-white">
+                            ${newTag}
+                            <div class="text-secondary fw-bold small mb-1">${data[key].label}</div>
+                            <div class="stat-number text-dark">${data[key].count}</div>
+                        </div>
+                    </div>`;
+            }
+        });
+
+        // 加载网络边界视图链
+        function loadChain(query='') {
+            fetch('/api/chain?q=' + encodeURIComponent(query)).then(r=>r.json()).then(data => {
+                const tb = document.getElementById('chain-tb');
+                tb.innerHTML = '';
+                data.forEach(row => {
+                    let cdnText = "-";
+                    if(row.is_cdn === 1) { cdnText = `<span class="badge bg-warning text-dark">是 (${row.cdn_name || '未知'})</span>`; } 
+                    else if(row.is_cdn === 0 && row.ip) { cdnText = `<span class="badge bg-success">否 (真实IP)</span>`; }
+                    
+                    let domainHtml = row.is_new_domain ? `<b>${row.domain || '-'}</b> <span class="badge bg-danger new-badge">🆕未读</span>` : `<b>${row.domain || '-'}</b>`;
+                    let portsHtml = '<span class="text-muted">无</span>';
+                    if (row.ports && row.ports.length > 0) {
+                        portsHtml = row.ports.map(p => {
+                            return p.is_new ? `<span class="badge bg-danger m-1 shadow-sm">${p.port} (未读)</span>` : `<span class="badge text-bg-light border m-1">${p.port}</span>`;
+                        }).join('');
+                    }
+
+                    tb.innerHTML += `<tr><td>${domainHtml}</td><td>${row.ip || '-'}</td><td>${cdnText}</td><td>${portsHtml}</td></tr>`;
+                });
+            });
+        }
+        
+        // 加载监控内容流面板
+        function loadContentPanels() {
+            fetch('/api/content').then(r=>r.json()).then(data => {
+                const mapHtml = (items, isUrl) => items.map(i => {
+                    let val = isUrl ? `<a href="${i.url}" class="url-link" target="_blank">${i.url}</a>` : `<b>${i.domain}</b>`;
+                    let badge = i.is_new ? `<span class="badge bg-danger ms-2">🆕未读</span>` : '';
+                    return `<tr><td style="word-break: break-all;">${val} ${badge}</td>${!isUrl ? `<td style="width: 15%">${badge || '<span class="badge bg-secondary">历史</span>'}</td>` : ''}</tr>`;
+                }).join('');
+                
+                document.getElementById('tb-js').innerHTML = data.js.length ? mapHtml(data.js, true) : '<tr><td class="text-muted text-center py-4">暂无 JS 数据流...</td></tr>';
+                document.getElementById('tb-urls').innerHTML = data.urls.length ? mapHtml(data.urls, true) : '<tr><td class="text-muted text-center py-4">暂无 URL 端点...</td></tr>';
+                document.getElementById('tb-certs').innerHTML = data.certs.length ? mapHtml(data.certs, false) : '<tr><td colspan="2" class="text-muted text-center py-4">暂无受监控的透明度证书...</td></tr>';
+            });
+        }
+
+        loadChain();
+        loadContentPanels();
+
+        document.getElementById('searchInput').addEventListener('keyup', (e) => {
+            if(e.key === 'Enter') loadChain(e.target.value);
+        });
+
+        // 核心一键已读回调指令
+        function ackAll() {
+            if(!confirm("⚠️ 确定要将大盘上所有红色的「未读发现」资产标为已读、并隐藏红圈警告光环吗？")) return;
+            fetch('/api/ack_all', {method: 'POST'}).then(r => r.json()).then(data => {
+                if(data.status === 'ok') location.reload();
+                else alert("服务出错，标记失败。");
+            }).catch(e => alert("网络通信断开，无法同步服务器配置..."));
+        }
+    </script>
+</body>
+</html>
