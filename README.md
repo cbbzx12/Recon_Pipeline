@@ -16,14 +16,18 @@
 ├── API配置检查单.md       # 推荐配置的 API 密钥等检查配置
 ├── README.md             # 使用向导文档
 ├── db/                   # 侦察系统 SQLite 数据库集群存放目录
-│   └── recon.db          # 核心资产漏洞数据库引擎
+│   ├── recon.db          # 核心资产漏洞数据库引擎
+│   ├── integrator.py     # 数据流入库引擎
+│   ├── init_db.py        # 数据库初始化脚本
+│   ├── web_ui.py         # Flask 资产审计面板
+│   └── templates/        # 面板前端模板
 ├── Bash/                 # 侦察业务执行引擎 (自动化核心脚本)
 │   ├── setup.sh          # 【最优先】用于一键安装所有配套工具、初始化下述扩展目录
 │   ├── auto_run.sh       # [无人值守] 多项目一键队列自动巡航扫描入口
 │   ├── target.txt        # [队列清单] 自动巡航的目标域配置文件
 │   ├── 1_subdomain_enum.sh   # [阶段 0] 子域名收集与 httpx 探活验证 
-│   ├── 2_bridge.sh           # [防封调度] DNS解析、智能 CDN 清洗与网段切分
-│   ├── 3_port_scan.sh        # [阶段 0.5] 非标端口发现、Web服务嗅探与指纹分析
+│   ├── 2_bridge.sh           # [阶段 0.5-A] DNS 解析、CDN 清洗、C段策略，自动移交 3_port_scan.sh
+│   ├── 3_port_scan.sh        # [阶段 0.5-B] masscan+nmap 端口扫描，session断点续扫，WAF检测，httpx验活
 │   ├── 4_harvest_Ultimate.sh # [阶段 1] URL、目录接口、敏感 JS 文件捕获
 │   ├── 5_import_to_db.sh     # 入库持久化 (将 Output 中结果统一整合)
 │   └── cert_monitor.py       # (功能挂机) 不间断的透明度证书网络新资产截获模块
@@ -36,8 +40,6 @@
 ├── Parameter/            # [由 setup 建立] Arjun 隐式参数发掘配置挂载点
 └── Git/                  # [由 setup 建立] Gitleaks 等凭证猎捕工具存放点
 ```
-
-*(注：`integrator.py`, `init_db.py`, `web_ui.py` 请直接部署于当前根目录。)*
 
 ---
 
@@ -99,8 +101,22 @@ chmod +x setup.sh
    Bash/1_subdomain_enum.sh <项目名称>
    ```
 
-2. **阶段 0.5：探活与指纹收集**
-   *(由于脚本内部逻辑依赖，可直接使用 `2_bridge.sh` 转接，或独立调用 `3_port_scan.sh`)*
+2. **阶段 0.5：DNS 解析 → CDN 过滤 → 端口扫描**
+
+   ```bash
+   # 完整链路：CDN 清洗后自动触发端口扫描（需 root，masscan 要求）
+   sudo Bash/2_bridge.sh <项目名称>
+
+   # 单独跑端口扫描（手动传入项目名或 IP 文件）
+   sudo Bash/3_port_scan.sh <项目名称>           # 保守模式
+   sudo Bash/3_port_scan.sh <项目名称> --fast    # 快速模式（rate=10000）
+   sudo Bash/3_port_scan.sh <项目名称> --no-waf  # 跳过 WAF 检测
+
+   # 查看/停止当前扫描会话（不需要 root）
+   Bash/3_port_scan.sh --list
+   Bash/3_port_scan.sh --stop <项目名称>
+   ```
+
 3. **阶段 1：收割路由与历史接口**
 
    ```bash
@@ -114,7 +130,12 @@ chmod +x setup.sh
    Bash/5_import_to_db.sh <项目名称>
    ```
 
-只要跑完入库，就可以通过面板 `web_ui.py` 一览战果了。
+只要跑完入库，就可以通过面板查看战果：
+
+```bash
+cd db && python3 web_ui.py
+# 浏览器访问 http://0.0.0.0:8080
+```
 
 ---
 
@@ -123,12 +144,15 @@ chmod +x setup.sh
 如需建立企业级定时重跑监测任务，可设置 Cron Job：基于 Linux 原生指令（如 `comm -23`）生成新旧快照变动。
 
 ```bash
-# 挂载增量资产并推入人工审查队列
-python integrator.py --db recon.db \
-  --delta diff_subdomains.txt \
-  --delta-type subdomain
+# 增量导入子域名、httpx 结果、端口扫描 CSV 等
+cd db
+python3 integrator.py --db recon.db --subfinder ../Output/<项目名>/latest/subs/all_subs.txt
+python3 integrator.py --db recon.db --httpx    ../Output/<项目名>/latest/subs/httpx_services.json
+python3 integrator.py --db recon.db --port-csv ../Output/<项目名>/latest/ports/results.csv
+python3 integrator.py --db recon.db --target <项目名> --urls ../Output/<项目名>/latest/content/all_urls.txt
+python3 integrator.py --db recon.db --target <项目名> --js   ../Output/<项目名>/latest/content/clean_js.txt
 
 # 启动 Web 面板
-python web_ui.py
-# 浏览器访问 127.0.0.1:8080 进入资产大盘处理待判定资产
+python3 web_ui.py
+# 浏览器访问 http://0.0.0.0:8080 进入资产大盘处理待判定资产
 ```

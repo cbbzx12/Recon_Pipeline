@@ -9,6 +9,11 @@ def upgrade_schema():
     if not os.path.exists(DB_PATH): return
     conn = sqlite3.connect(DB_PATH)
     try:
+        for col, definition in [('service', 'TEXT DEFAULT ""'), ('version', 'TEXT DEFAULT ""')]:
+            try:
+                conn.execute(f"ALTER TABLE services ADD COLUMN {col} {definition}")
+            except Exception:
+                pass
         conn.execute('''CREATE TABLE IF NOT EXISTS js_files (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             url TEXT UNIQUE NOT NULL,
@@ -91,7 +96,7 @@ def api_chain():
     rows = conn.execute(f"""
         SELECT 
             d.domain, d.is_new AS is_new_domain, i.ip, d.is_cdn, d.cdn_name,
-            (SELECT GROUP_CONCAT(s.port || CASE WHEN s.is_new = 1 THEN '#NEW' ELSE '' END, ', ') FROM services s WHERE s.ip = i.ip) AS ports_raw
+            (SELECT GROUP_CONCAT(s.port || '/' || COALESCE(NULLIF(s.service,''),'?') || CASE WHEN s.is_new = 1 THEN '#NEW' ELSE '' END, ', ') FROM services s WHERE s.ip = i.ip) AS ports_raw
         FROM domain_records d
         LEFT JOIN ips i ON i.ip = d.resolved_ip
         WHERE {where}

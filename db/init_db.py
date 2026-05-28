@@ -52,6 +52,8 @@ def init_db():
         ip TEXT NOT NULL,
         port INTEGER NOT NULL,
         protocol TEXT DEFAULT 'tcp',
+        service TEXT DEFAULT '',
+        version TEXT DEFAULT '',
         first_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
         last_seen DATETIME,
         is_new BOOLEAN DEFAULT 1,

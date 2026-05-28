@@ -103,16 +103,16 @@ echo -e "\e[1;34m[*] ==========================================\e[0m"
 echo -e "\e[1;34m[*] 阶段 3：移交至端口扫描引擎\e[0m"
 echo -e "\e[1;34m[*] ==========================================\e[0m"
 
-if [ ! -x "./port_scan.sh" ]; then
-    chmod +x ./port_scan.sh 2>/dev/null
+if [ ! -x "$SCRIPT_DIR/3_port_scan.sh" ]; then
+    chmod +x "$SCRIPT_DIR/3_port_scan.sh" 2>/dev/null
 fi
 
-if [ -f "./port_scan.sh" ]; then
+if [ -f "$SCRIPT_DIR/3_port_scan.sh" ]; then
     TARGET_COUNT=$(wc -l < "$REAL_IP_FILE")
-    echo "[-] 正在将 $TARGET_COUNT 个目标移交至 port_scan.sh ..."
-    "$SCRIPT_DIR/port_scan.sh" "$REAL_IP_FILE"
+    echo "[-] 正在将 $TARGET_COUNT 个目标移交至 3_port_scan.sh ..."
+    "$SCRIPT_DIR/3_port_scan.sh" "$REAL_IP_FILE"
 else
-    echo -e "\e[1;31m[!] 未在当前目录下找到 port_scan.sh 脚本。\e[0m"
+    echo -e "\e[1;31m[!] 未找到 3_port_scan.sh 脚本：$SCRIPT_DIR/3_port_scan.sh\e[0m"
     exit 1
 fi
 
