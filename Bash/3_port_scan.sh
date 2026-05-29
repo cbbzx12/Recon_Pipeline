@@ -24,11 +24,12 @@ DELAY_MIN=3
 DELAY_MAX=8
 NMAP_TIMING="-T2"
 NMAP_MAX_RATE="--max-rate 50"
-NMAP_FLAGS="-sV -Pn -n"
+NMAP_FLAGS="-sS -sV -Pn -n"
 NMAP_SCRIPT_TIMEOUT="60s"
 NMAP_TIMEOUT="--host-timeout 300s"
 FAST_MODE=0
 CHECK_WAF=1
+PARALLEL=1
 
 MASSCAN=""
 NMAP=""
@@ -43,16 +44,29 @@ COMPLETED_FILE=""
 RESULTS_FILE=""
 LOG_FILE=""
 PID_FILE=""
+LOCK_FILE=""
 
 # ─── 工具函数 ─────────────────────────────────────────────────────────────────
 log() {
     local level="$1"; shift
-    local msg="$*"
-    local ts
-    ts=$(date '+%Y-%m-%d %H:%M:%S')
-    local line="[$ts] [$(printf '%-5s' "$level")] $msg"
-    echo "$line"
-    [[ -n "${LOG_FILE:-}" ]] && echo "$line" >> "$LOG_FILE"
+    local ts; ts=$(date '+%Y-%m-%d %H:%M:%S')
+    local line="[$ts] [$(printf '%-5s' "$level")] $*"
+    if [[ -n "${LOCK_FILE:-}" && -e "${LOCK_FILE}" ]]; then
+        ( flock -x 200; echo "$line"; [[ -n "${LOG_FILE:-}" ]] && echo "$line" >> "$LOG_FILE" ) 200>"$LOCK_FILE"
+    else
+        echo "$line"
+        [[ -n "${LOG_FILE:-}" ]] && echo "$line" >> "$LOG_FILE"
+    fi
+}
+
+safe_append() {
+    local file="$1"; shift
+    ( flock -x 200; printf '%s\n' "$@" >> "$file" ) 200>"$LOCK_FILE"
+}
+
+safe_append_raw() {
+    local file="$1"; shift
+    ( flock -x 200; printf '%s' "$@" >> "$file" ) 200>"$LOCK_FILE"
 }
 
 die() { echo "[ERROR] $*" >&2; exit 1; }
@@ -131,6 +145,8 @@ resolve_paths() {
     RESULTS_FILE="$SESSION_DIR/results.csv"
     LOG_FILE="$SESSION_DIR/scan.log"
     PID_FILE="$SESSION_DIR/running.pid"
+    LOCK_FILE="$SESSION_DIR/.lock"
+    : > "$LOCK_FILE"
 }
 
 # ─── 列出/停止（以 domain 推导 WORKSPACE）────────────────────────────────────
@@ -188,41 +204,240 @@ do_stop() {
     exit 0
 }
 
-# ─── CSV → XLSX ───────────────────────────────────────────────────────────────
-csv_to_xlsx() {
+# ─── CSV → HTML ───────────────────────────────────────────────────────────────
+csv_to_html() {
     local csv="$1"
-    local xlsx="${csv%.csv}.xlsx"
-    command -v python3 &>/dev/null || { log WARN "python3 未找到，跳过 XLSX 转换"; return; }
-    python3 - "$csv" "$xlsx" <<'PYEOF'
-import sys, csv, os
-csv_path, xlsx_path = sys.argv[1], sys.argv[2]
+    local html_out="${csv%.csv}.html"
+    local session_name
+    session_name=$(basename "$(dirname "$(dirname "$csv")")")
+    local total_targets=0 total_scanned=0
+    [[ -f "$TARGETS_FILE" ]]   && total_targets=$(wc -l < "$TARGETS_FILE" | tr -d ' ')
+    [[ -f "$COMPLETED_FILE" ]] && total_scanned=$(wc -l < "$COMPLETED_FILE" | tr -d ' ')
+    command -v python3 &>/dev/null || { log WARN "python3 未找到，跳过 HTML 生成"; return; }
+    python3 - "$csv" "$html_out" "$session_name" "$total_targets" "$total_scanned" <<'PYEOF'
+import sys, csv, json, io
+from collections import Counter
+from datetime import datetime
+
+csv_path, html_path, session = sys.argv[1], sys.argv[2], sys.argv[3]
+total_tgts = int(sys.argv[4]) if len(sys.argv) > 4 else 0
+total_done = int(sys.argv[5]) if len(sys.argv) > 5 else 0
+
+rows = []
 try:
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment
-    from openpyxl.utils import get_column_letter
-except ImportError:
-    print("[WARN] openpyxl 未安装: pip3 install openpyxl", file=sys.stderr); sys.exit(0)
-wb = Workbook()
-ws = wb.active
-ws.title = "PortScan"
-hf = Font(bold=True, color="FFFFFF")
-hfill = PatternFill("solid", fgColor="2F5496")
-ha = Alignment(horizontal="center")
-col_widths = {}
-with open(csv_path, newline='', encoding='utf-8') as f:
-    for i, row in enumerate(csv.reader(f), 1):
-        ws.append(row)
-        for j, v in enumerate(row, 1):
-            col_widths[j] = max(col_widths.get(j, 0), len(str(v)) + 2)
-        if i == 1:
-            for j in range(1, len(row)+1):
-                c = ws.cell(row=1, column=j)
-                c.font = hf; c.fill = hfill; c.alignment = ha
-ws.freeze_panes = "A2"
-for j, w in col_widths.items():
-    ws.column_dimensions[get_column_letter(j)].width = min(w, 60)
-wb.save(xlsx_path)
-print(f"[INFO] XLSX 已生成: {xlsx_path}", file=sys.stderr)
+    with open(csv_path, 'r', encoding='utf-8') as f:
+        for row in csv.DictReader(io.StringIO(f.read())):
+            ip  = row.get('IP','').strip('"')
+            pt  = row.get('Port','').strip('"')
+            svc = row.get('Service','').strip('"')
+            ver = row.get('Version','').strip('"')
+            if ip: rows.append({'ip':ip,'port':pt,'service':svc,'version':ver})
+except Exception as e:
+    print(f"[WARN] CSV 解析错误: {e}", file=sys.stderr)
+
+total_ports = len(rows)
+unique_ips  = len(set(r['ip'] for r in rows))
+top_versions = Counter(r['version'] or 'unknown' for r in rows).most_common(10)
+top_ports    = Counter(r['port'].split('/')[0] for r in rows).most_common(10)
+
+WAF_SIGS = {
+    'elb':'AWS ELB','awselb':'AWS ELB','openresty':'OpenResty/Ali WAF',
+    'tengine':'Alibaba Tengine','cloudflare':'Cloudflare WAF',
+    'akamai':'Akamai WAF','f5':'F5 BIG-IP','incapsula':'Incapsula WAF',
+    'sucuri':'Sucuri WAF','huawei':'Huawei IPS',
+}
+SENS_PORTS = {
+    '23':('Telnet','critical'),'3389':('RDP','high'),'3306':('MySQL','high'),
+    '6379':('Redis','high'),'27017':('MongoDB','high'),'5432':('PostgreSQL','high'),
+    '21':('FTP','medium'),'22':('SSH','info'),'1883':('MQTT','medium'),
+}
+RISK_ORD = {'critical':0,'high':1,'medium':2,'info':3,'low':4}
+
+waf_map = {}
+for r in rows:
+    vl = r['version'].lower()
+    for key,label in WAF_SIGS.items():
+        if key in vl:
+            waf_map.setdefault(r['ip'], label)
+            break
+
+sens_rows = sorted(
+    [dict(**r, port_name=SENS_PORTS[p][0], risk=SENS_PORTS[p][1])
+     for r in rows if (p:=r['port'].split('/')[0]) in SENS_PORTS],
+    key=lambda x: RISK_ORD.get(x['risk'],9)
+)
+high_risk_count = sum(1 for r in sens_rows if r['risk'] in ('critical','high'))
+now = datetime.now().strftime('%Y-%m-%d %H:%M')
+stat_tgts = total_tgts if total_tgts > 0 else unique_ips
+stat_done = total_done if total_done > 0 else unique_ips
+
+cv_labels = json.dumps([v[0] for v in top_versions])
+cv_data   = json.dumps([v[1] for v in top_versions])
+cp_labels = json.dumps([f":{p[0]}" for p in top_ports])
+cp_data   = json.dumps([p[1] for p in top_ports])
+
+RISK_CSS = {
+    'critical':'background:#fef2f2;color:#dc2626;border:1px solid #fecaca',
+    'high':    'background:#fff7ed;color:#ea580c;border:1px solid #fed7aa',
+    'medium':  'background:#fefce8;color:#ca8a04;border:1px solid #fef08a',
+    'info':    'background:#eff6ff;color:#2563eb;border:1px solid #bfdbfe',
+    'low':     'background:#f8fafc;color:#64748b;border:1px solid #e2e8f0',
+}
+RISK_LBL = {'critical':'严重','high':'高危','medium':'中危','info':'信息','low':'低危'}
+
+def rbadge(risk):
+    s = RISK_CSS.get(risk,'background:#f8fafc;color:#64748b')
+    l = RISK_LBL.get(risk,'未知')
+    return f'<span style="display:inline-block;padding:.15rem .5rem;border-radius:4px;font-size:.75rem;font-weight:600;{s}">{l}</span>'
+
+waf_rows_html = ''.join(
+    f'<tr><td class="ip">{ip}</td><td>{label}</td></tr>\n'
+    for ip, label in waf_map.items()
+)
+sens_rows_html = ''.join(
+    f'<tr data-risk="{r["risk"]}">'
+    f'<td class="ip">{r["ip"]}</td>'
+    f'<td style="font-family:monospace">{r["port"]} <span style="color:#94a3b8;font-size:.75rem">({r["port_name"]})</span></td>'
+    f'<td>{rbadge(r["risk"])}</td>'
+    f'<td><code>{r["version"] or "-"}</code></td></tr>\n'
+    for r in sens_rows
+)
+all_rows_html = ''.join(
+    f'<tr><td class="ip">{r["ip"]}</td>'
+    f'<td style="font-family:monospace">{r["port"]}</td>'
+    f'<td style="color:#475569">{r["service"]}</td>'
+    f'<td><code>{r["version"] or "-"}</code></td></tr>\n'
+    for r in rows
+)
+
+html = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>端口扫描报告 · {session}</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+:root{{--bg:#f1f5f9;--card:#ffffff;--bd:#e2e8f0;--txt:#1e293b;--mt:#64748b;--ac:#4f46e5;--ac2:#0891b2}}
+body{{background:var(--bg);color:var(--txt);font-family:'Segoe UI',system-ui,sans-serif;font-size:14px}}
+.hdr{{background:#ffffff;border-bottom:1px solid var(--bd);padding:1.25rem 2rem;box-shadow:0 1px 3px rgba(0,0,0,.06)}}
+.hdr h1{{font-size:1.4rem;font-weight:700;color:var(--ac)}}
+.hdr p{{color:var(--mt);font-size:.82rem;margin-top:.2rem}}
+.meta{{display:flex;gap:1.5rem;margin-top:.6rem;flex-wrap:wrap}}
+.meta span{{color:var(--mt);font-size:.8rem}}.meta strong{{color:var(--txt)}}
+.con{{max-width:1400px;margin:0 auto;padding:1.5rem 2rem}}
+.sg{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:1rem;margin-bottom:1.5rem}}
+.sc{{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:1rem 1.2rem;border-top:3px solid transparent}}
+.sc.b{{border-top-color:#3b82f6}}.sc.g{{border-top-color:#22c55e}}
+.sc.y{{border-top-color:#f59e0b}}.sc.r{{border-top-color:#ef4444}}.sc.p{{border-top-color:#8b5cf6}}
+.sc .lbl{{font-size:.72rem;color:var(--mt);text-transform:uppercase;letter-spacing:.05em;font-weight:500}}
+.sc .val{{font-size:1.8rem;font-weight:700;margin-top:.2rem}}
+.sc.b .val{{color:#2563eb}}.sc.g .val{{color:#16a34a}}.sc.y .val{{color:#d97706}}
+.sc.r .val{{color:#dc2626}}.sc.p .val{{color:#7c3aed}}
+.sc .sub{{font-size:.72rem;color:var(--mt);margin-top:.1rem}}
+.cg{{display:grid;grid-template-columns:1fr 1fr;gap:1.2rem;margin-bottom:1.5rem}}
+@media(max-width:800px){{.cg{{grid-template-columns:1fr}}}}
+.cc{{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:1.2rem}}
+.cc h3{{font-size:.85rem;font-weight:600;color:var(--txt);margin-bottom:.8rem;padding-bottom:.5rem;border-bottom:1px solid var(--bd)}}
+.cw{{height:220px;position:relative}}
+.sec{{background:var(--card);border:1px solid var(--bd);border-radius:10px;margin-bottom:1.5rem;overflow:hidden}}
+.sh{{padding:.9rem 1.2rem;border-bottom:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:.5rem;background:#fafafa}}
+.sh h2{{font-size:.9rem;font-weight:600;color:var(--txt)}}
+.ctrl{{display:flex;gap:.5rem;align-items:center}}
+.si{{background:#ffffff;border:1px solid var(--bd);color:var(--txt);padding:.35rem .7rem;border-radius:6px;font-size:.82rem;width:200px;outline:none}}
+.si:focus{{border-color:var(--ac);box-shadow:0 0 0 3px rgba(79,70,229,.1)}}
+.fs{{background:#ffffff;border:1px solid var(--bd);color:var(--txt);padding:.35rem .55rem;border-radius:6px;font-size:.78rem;outline:none;cursor:pointer}}
+.tw{{overflow-x:auto;max-height:440px;overflow-y:auto}}
+table{{width:100%;border-collapse:collapse;font-size:.82rem}}
+thead th{{background:#f8fafc;color:var(--mt);font-size:.72rem;text-transform:uppercase;letter-spacing:.04em;padding:.6rem 1rem;text-align:left;position:sticky;top:0;z-index:1;border-bottom:1px solid var(--bd);white-space:nowrap;cursor:pointer;user-select:none;font-weight:600}}
+thead th:hover{{color:var(--txt)}}
+tbody tr{{border-bottom:1px solid #f1f5f9}}
+tbody tr:hover{{background:#f8fafc}}
+tbody td{{padding:.55rem 1rem;color:var(--txt)}}
+.ip{{font-family:monospace;color:var(--ac2);font-weight:500}}
+code{{color:#475569;font-size:.8rem;background:#f1f5f9;padding:.1rem .3rem;border-radius:3px}}
+.ci{{font-size:.75rem;color:var(--mt);padding:.4rem 1rem;border-top:1px solid var(--bd);background:#fafafa}}
+</style>
+</head>
+<body>
+<div class="hdr">
+<div style="max-width:1400px;margin:0 auto">
+<div style="display:flex;align-items:center;gap:.75rem">
+<div style="width:34px;height:34px;background:linear-gradient(135deg,#4f46e5,#0891b2);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:1rem;flex-shrink:0">🔍</div>
+<div><h1>端口扫描报告 · {session}</h1><p>masscan + nmap 全端口版本探测结果</p></div>
+</div>
+<div class="meta">
+<span>目标数: <strong>{stat_tgts:,}</strong></span>
+<span>已扫描: <strong>{stat_done:,}</strong></span>
+<span>生成时间: <strong>{now}</strong></span>
+</div>
+</div>
+</div>
+<div class="con">
+<div class="sg">
+<div class="sc b"><div class="lbl">目标 IP</div><div class="val">{stat_tgts:,}</div><div class="sub">已扫描 {stat_done:,} 个</div></div>
+<div class="sc g"><div class="lbl">开放端口</div><div class="val">{total_ports:,}</div><div class="sub">{unique_ips} 个主机响应</div></div>
+<div class="sc y"><div class="lbl">WAF / 防护</div><div class="val">{len(waf_map)}</div><div class="sub">检测到防护特征</div></div>
+<div class="sc r"><div class="lbl">高危端口</div><div class="val">{high_risk_count}</div><div class="sub">含 RDP/DB/Telnet</div></div>
+<div class="sc p"><div class="lbl">RDP 暴露</div><div class="val">{sum(1 for r in rows if r["port"].startswith("3389"))}</div><div class="sub">端口 3389</div></div>
+</div>
+<div class="cg">
+<div class="cc"><h3>📊 服务版本分布 Top 10</h3><div class="cw"><canvas id="vc"></canvas></div></div>
+<div class="cc"><h3>🔌 开放端口分布 Top 10</h3><div class="cw"><canvas id="pc"></canvas></div></div>
+</div>
+<div class="sec">
+<div class="sh"><h2>🛡️ WAF / 防护设备 <span style="font-size:.75rem;font-weight:400;color:var(--mt)">({len(waf_map)} 个 IP)</span></h2>
+<div class="ctrl"><input class="si" id="ws" placeholder="搜索 IP / 类型..." oninput="ft('wt','ws','wc')"></div></div>
+<div class="tw"><table id="wt">
+<thead><tr><th onclick="st('wt',0)">IP 地址 ⇅</th><th onclick="st('wt',1)">防护类型 ⇅</th></tr></thead>
+<tbody>{waf_rows_html}</tbody></table></div>
+<div class="ci" id="wc">共 {len(waf_map)} 条记录</div>
+</div>
+<div class="sec">
+<div class="sh"><h2>⚠️ 高危端口暴露 <span style="font-size:.75rem;font-weight:400;color:var(--mt)">({len(sens_rows)} 条)</span></h2>
+<div class="ctrl">
+<input class="si" id="ss" placeholder="搜索 IP / 端口..." oninput="ft('st2','ss','sc2')">
+<select class="fs" onchange="fr(this.value)"><option value="">全部风险</option>
+<option value="critical">严重</option><option value="high">高危</option>
+<option value="medium">中危</option><option value="info">信息</option></select>
+</div></div>
+<div class="tw"><table id="st2">
+<thead><tr><th onclick="st('st2',0)">IP 地址 ⇅</th><th onclick="st('st2',1)">端口 ⇅</th>
+<th onclick="st('st2',2)">风险等级 ⇅</th><th onclick="st('st2',3)">版本指纹 ⇅</th></tr></thead>
+<tbody>{sens_rows_html}</tbody></table></div>
+<div class="ci" id="sc2">共 {len(sens_rows)} 条记录</div>
+</div>
+<div class="sec">
+<div class="sh"><h2>📋 全部扫描结果 <span style="font-size:.75rem;font-weight:400;color:var(--mt)">({total_ports} 条)</span></h2>
+<div class="ctrl">
+<input class="si" id="ms" placeholder="搜索 IP / 端口 / 版本..." oninput="ft('mt','ms','mc')">
+<select class="fs" onchange="fc('mt',2,this.value,'mc')"><option value="">全部服务</option>
+<option value="http">http</option><option value="ssl">ssl/https</option>
+<option value="ssh">ssh</option><option value="ms-wbt-server">RDP</option></select>
+</div></div>
+<div class="tw"><table id="mt">
+<thead><tr><th onclick="st('mt',0)">IP 地址 ⇅</th><th onclick="st('mt',1)">端口 ⇅</th>
+<th onclick="st('mt',2)">服务类型 ⇅</th><th onclick="st('mt',3)">版本指纹 ⇅</th></tr></thead>
+<tbody>{all_rows_html}</tbody></table></div>
+<div class="ci" id="mc">共 {total_ports} 条记录</div>
+</div>
+</div>
+<script>
+const C=['#4f46e5','#0891b2','#f59e0b','#ef4444','#22c55e','#8b5cf6','#fb923c','#34d399','#60a5fa','#f472b6'];
+new Chart(document.getElementById('vc'),{{type:'bar',data:{{labels:{cv_labels},datasets:[{{label:'数量',data:{cv_data},backgroundColor:C,borderRadius:3,borderSkipped:false}}]}},options:{{responsive:true,maintainAspectRatio:false,plugins:{{legend:{{display:false}}}},scales:{{x:{{ticks:{{color:'#64748b',font:{{size:10}}}},grid:{{color:'rgba(0,0,0,.05)'}}}},y:{{ticks:{{color:'#64748b'}},grid:{{color:'rgba(0,0,0,.05)'}}}}}}}}}});
+new Chart(document.getElementById('pc'),{{type:'bar',data:{{labels:{cp_labels},datasets:[{{label:'数量',data:{cp_data},backgroundColor:C.slice(2),borderRadius:3,borderSkipped:false}}]}},options:{{indexAxis:'y',responsive:true,maintainAspectRatio:false,plugins:{{legend:{{display:false}}}},scales:{{x:{{ticks:{{color:'#64748b'}},grid:{{color:'rgba(0,0,0,.05)'}}}},y:{{ticks:{{color:'#64748b',font:{{size:10}}}},grid:{{display:false}}}}}}}}}});
+function ft(tid,iid,cid){{const q=document.getElementById(iid).value.toLowerCase(),rows=document.querySelectorAll('#'+tid+' tbody tr');let n=0;rows.forEach(r=>{{const m=r.textContent.toLowerCase().includes(q);r.style.display=m?'':'none';if(m)n++}});document.getElementById(cid).textContent='显示 '+n+' / 共 '+rows.length+' 条记录'}}
+function fr(risk){{const rows=document.querySelectorAll('#st2 tbody tr');let n=0;rows.forEach(r=>{{const m=!risk||r.dataset.risk===risk;r.style.display=m?'':'none';if(m)n++}});document.getElementById('sc2').textContent='显示 '+n+' / 共 '+rows.length+' 条记录'}}
+function fc(tid,col,val,cid){{const q=val.toLowerCase(),rows=document.querySelectorAll('#'+tid+' tbody tr');let n=0;rows.forEach(r=>{{const c=r.cells[col],m=!q||(c&&c.textContent.toLowerCase().includes(q));r.style.display=m?'':'none';if(m)n++}});document.getElementById(cid).textContent='显示 '+n+' / 共 '+rows.length+' 条记录'}}
+const ss={{}};
+function st(tid,col){{const t=document.getElementById(tid),b=t.querySelector('tbody'),rows=[...b.querySelectorAll('tr')];const k=tid+'_'+col,asc=ss[k]!==true;ss[k]=asc;rows.sort((a,b)=>{{const av=a.cells[col]?.textContent.trim()||'',bv=b.cells[col]?.textContent.trim()||'';const an=parseFloat(av),bn=parseFloat(bv);if(!isNaN(an)&&!isNaN(bn))return asc?an-bn:bn-an;return asc?av.localeCompare(bv):bv.localeCompare(av)}});rows.forEach(r=>b.appendChild(r))}}
+</script>
+</body></html>"""
+
+with open(html_path, 'w', encoding='utf-8') as f:
+    f.write(html)
+print(f"[INFO] HTML 报告已生成: {html_path}", file=sys.stderr)
 PYEOF
 }
 
@@ -311,20 +526,22 @@ scan_ip() {
         "$ip" 2>/dev/null || true)
 
     local port_count=0
+    local csv_buf=""
     while IFS= read -r match; do
         local port proto svc ver
         IFS='/' read -r port _ proto _ svc _ ver _ <<< "$match"
         ver="${ver:-unknown}"
-        printf '"%s","%s/%s","%s","%s"\n' "$ip" "$port" "$proto" "$svc" "$ver" >> "$RESULTS_FILE"
+        csv_buf+="$(printf '"%s","%s/%s","%s","%s"\n' "$ip" "$port" "$proto" "$svc" "$ver")"
         log INFO "[$idx/$total] [结果] $ip  $port/$proto  $svc  $ver"
         (( port_count++ )) || true
     done < <(echo "$nm_out" | grep "^Host:" | grep -oP '\d+/open/[^,\t ]+')
 
+    [[ -n "$csv_buf" ]] && safe_append_raw "$RESULTS_FILE" "$csv_buf"
     [[ $port_count -eq 0 ]] && log WARN "[$idx/$total] $ip: nmap 未解析出服务（端口可能被过滤）"
     log INFO "[$idx/$total] $ip: nmap 完成，写入 $port_count 条记录"
 
     detect_waf "$ip" "$nm_out"
-    echo "$ip" >> "$COMPLETED_FILE"
+    safe_append "$COMPLETED_FILE" "$ip"
 }
 
 # ─── httpx Web 验活 ───────────────────────────────────────────────────────────
@@ -383,7 +600,7 @@ print_summary() {
     echo " 阶段1 端口扫描汇总"
     echo "══════════════════════════════════════════════"
     printf " 扫描目标: %-5d  已完成: %-5d  发现服务: %d\n" "$total" "$done" "$svcs"
-    echo " 结果文件: ${RESULTS_FILE%.csv}.xlsx"
+    echo " 结果文件: ${RESULTS_FILE%.csv}.html"
     echo " 日志文件: $LOG_FILE"
     echo "══════════════════════════════════════════════"
     if [[ $svcs -gt 0 ]]; then
@@ -411,8 +628,9 @@ masscan 参数（通过环境变量覆盖）:
   MASS_PORTS=1-65535
   MASS_WAIT=5       最后一包后等待秒数
 
-模式:
-  --fast            快速模式（rate=10000, nmap -T4 -sS -Pn -n，需 root）
+并行与模式:
+  --parallel N      同时扫描 N 个 IP（默认 1，--fast 默认 5）
+  --fast            快速模式（rate=10000, nmap -T4 -sS -Pn -n，并行5）
   --no-waf          跳过 WAF 检测
 
 示例:
@@ -438,11 +656,13 @@ main() {
     fi
 
     local arg="$1"; shift || true
+    local user_set_parallel=0
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --fast)   FAST_MODE=1; shift ;;
-            --no-waf) CHECK_WAF=0; shift ;;
+            --fast)     FAST_MODE=1; shift ;;
+            --no-waf)   CHECK_WAF=0; shift ;;
+            --parallel) PARALLEL="$2"; user_set_parallel=1; shift 2 ;;
             *) die "未知参数: $1" ;;
         esac
     done
@@ -458,7 +678,8 @@ main() {
         NMAP_TIMING="-T4"; NMAP_MAX_RATE=""
         NMAP_FLAGS="-sS -Pn -n -sV"
         NMAP_SCRIPT_TIMEOUT="10s"; NMAP_TIMEOUT="--host-timeout 60s"
-        log INFO "快速模式已启用（masscan rate=$MASS_RATE, nmap $NMAP_TIMING）"
+        [[ $user_set_parallel -eq 0 ]] && PARALLEL=5
+        log INFO "快速模式已启用（masscan rate=$MASS_RATE, nmap $NMAP_TIMING, 并行=$PARALLEL）"
     fi
 
     log INFO "==== 阶段1 端口扫描启动 ===="
@@ -515,7 +736,15 @@ main() {
         exit 0
     fi
 
-    log INFO "总目标: $total | 已完成: $done_count | 待扫描: $(( total - done_count ))"
+    # 构建待扫描列表（并行模式下必须预加载，避免竞态）
+    local -a pending_ips=()
+    while IFS= read -r ip || [[ -n "$ip" ]]; do
+        [[ -z "$ip" ]] && continue
+        grep -qxF "$ip" "$COMPLETED_FILE" 2>/dev/null || pending_ips+=("$ip")
+    done < "$TARGETS_FILE"
+    local pending=${#pending_ips[@]}
+
+    log INFO "总目标: $total | 已完成: $done_count | 待扫描: $pending | 并行数: $PARALLEL"
 
     # 写 PID
     echo $$ > "$PID_FILE"
@@ -524,36 +753,53 @@ main() {
     cleanup() {
         INTERRUPTED=1
         log INFO "收到中断信号，正在保存进度..."
+        local child_pids
+        child_pids=$(jobs -rp 2>/dev/null || true)
+        [[ -n "$child_pids" ]] && kill $child_pids 2>/dev/null || true
+        wait 2>/dev/null || true
         rm -f "$PID_FILE"
         local cur_done
         cur_done=$(wc -l < "$COMPLETED_FILE")
         log INFO "已完成 ${cur_done}/${total}，续扫: sudo $0 $arg"
-        csv_to_xlsx "$RESULTS_FILE" 2>&1 || true
+        csv_to_html "$RESULTS_FILE" 2>&1 || true
         exit 0
     }
     trap cleanup SIGINT SIGTERM
 
     # 主扫描循环
     local idx=0
-    while IFS= read -r ip || [[ -n "$ip" ]]; do
-        [[ -z "$ip" ]] && continue
-        grep -qxF "$ip" "$COMPLETED_FILE" 2>/dev/null && continue
+    for ip in "${pending_ips[@]}"; do
+        [[ $INTERRUPTED -eq 1 ]] && break
         (( idx++ )) || true
-        scan_ip "$ip" "$((done_count + idx))" "$total"
-        if [[ $INTERRUPTED -eq 0 && $idx -lt $(( total - done_count )) && $DELAY_MAX -gt 0 ]]; then
-            local wait_sec
-            wait_sec=$(( DELAY_MIN + RANDOM % (DELAY_MAX - DELAY_MIN + 1) ))
-            log INFO "等待 ${wait_sec}s 后继续..."
-            sleep "$wait_sec"
+
+        if [[ $PARALLEL -le 1 ]]; then
+            scan_ip "$ip" "$((done_count + idx))" "$total"
+            if [[ $INTERRUPTED -eq 0 && $idx -lt $pending && $DELAY_MAX -gt 0 ]]; then
+                local wait_sec
+                wait_sec=$(( DELAY_MIN + RANDOM % (DELAY_MAX - DELAY_MIN + 1) ))
+                log INFO "等待 ${wait_sec}s 后继续..."
+                sleep "$wait_sec"
+            fi
+        else
+            scan_ip "$ip" "$((done_count + idx))" "$total" &
+            while (( $(jobs -rp | wc -l) >= PARALLEL )); do
+                wait -n 2>/dev/null || true
+            done
         fi
-    done < "$TARGETS_FILE"
+    done
+
+    # 等待所有并行子任务完成
+    if [[ $PARALLEL -gt 1 ]]; then
+        log INFO "等待剩余并行任务完成..."
+        wait 2>/dev/null || true
+    fi
 
     rm -f "$PID_FILE"
     local final_done
     final_done=$(wc -l < "$COMPLETED_FILE")
     log INFO "==== 扫描完成 ===="
     print_summary "$total" "$final_done"
-    csv_to_xlsx "$RESULTS_FILE" 2>&1 | tee -a "$LOG_FILE" || true
+    csv_to_html "$RESULTS_FILE" 2>&1 | tee -a "$LOG_FILE" || true
     run_httpx
 }
 
