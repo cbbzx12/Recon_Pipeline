@@ -49,7 +49,7 @@
 
 ```bash
 # 1. 克隆代码仓库
-git clone https://github.com/YourName/ReconPipeline.git
+git clone https://github.com/cbbzx12/Recon_Pipeline.git
 cd ReconPipeline/Bash
 
 # 2. 授予安装脚本执行权限
